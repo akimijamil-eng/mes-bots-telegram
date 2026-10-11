@@ -11,7 +11,7 @@ import httpx
 # ==========================================
 # CONFIGURATION
 # ==========================================
-TOKEN = ""
+TOKEN = "8710962585:AAGOgrXIqfeiUcQGnJBvJHpIuLCDhLiMsuE"
 DB_FILE = "users.json"
 ADMIN_ID = ""  # Remplace par ton vrai ID Telegram (string)
 
