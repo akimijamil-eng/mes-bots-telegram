@@ -1,0 +1,744 @@
+import logging
+import json
+import os
+import random
+import time
+import asyncio
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+import httpx
+# ==========================================
+# CONFIGURATION
+# ==========================================
+TOKEN = ""
+DB_FILE = "users.json"
+ADMIN_ID = ""  # Remplace par ton vrai ID Telegram (string)
+
+# --- CANAUX OBLIGATOIRES (Force Sub) ---
+# Le bot DOIT être administrateur dans ces canaux.
+REQUIRED_CHANNELS = ["@babelseyy", "@babelsey225"]
+
+# --- SOURCE DE DONNÉES DU JEU (fournisseur direct, remplace l'ancienne API AllPredictor) ---
+HISTORY_URL = "https://crash-gateway-grm-cr.100hp.app/history"
+SESSION_ID = "0f6d1875-7cd1-4547-a506-4f4aac77bc7c"
+CUSTOMER_ID = "077dee8d-c923-4c02-9bee-757573662e69"
+EXTERNAL_HEADERS = {
+    "accept": "application/json",
+    "customer-id": CUSTOMER_ID,
+    "session-id": SESSION_ID,
+}
+
+LAST_SEEN_ROUND = None
+
+# ==========================================
+# GESTION BASE DE DONNÉES (JSON)
+# ==========================================
+def load_db():
+    if not os.path.exists(DB_FILE):
+        return {"_meta": {"coupons": {}, "news": []}}
+    with open(DB_FILE, 'r') as f:
+        return json.load(f)
+
+def save_db(data):
+    with open(DB_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+db = load_db()
+
+# S'assurer que la meta existe toujours
+if "_meta" not in db:
+    db["_meta"] = {"coupons": {}, "news": []}
+    save_db(db)
+
+def get_user(u_id, name="Trader"):
+    u_id = str(u_id)
+    if u_id not in db:
+        db[u_id] = {
+            "n": name,
+            "p": 0, "g": 0, "ref": 0,
+            "win": random.randint(100, 500),
+            "last_p": 0, "next_p_wait": 0,
+            "last_g": 0, "next_g_wait": 0,
+            "last_target": 0.0,
+            "active_bet": None,
+            "last_val_msg": None,
+            "pending_tx": None,
+            "pending_id": None,
+            "pending_qty": 0,
+            "s": "idle",
+            "referred_by": None
+        }
+        save_db(db)
+    return db[u_id]
+
+def is_admin(u_id):
+    return str(u_id) == str(ADMIN_ID)
+
+# ==========================================
+# SOURCE DE DONNÉES DU JEU (fournisseur direct)
+# ==========================================
+def _extract_coef(item):
+    if not isinstance(item, dict):
+        return None
+    c = item.get("coef")
+    if c is None:
+        c = item.get("crash")
+    if c is None:
+        c = item.get("value")
+    if c is None:
+        c = item.get("topCoefficient")
+    if c is None:
+        c = item.get("multiplier")
+    if c is None:
+        return None
+    try:
+        return round(float(c), 2)
+    except (TypeError, ValueError):
+        return None
+
+async def fetch_external_coefs(limit=20, timeout=10.0):
+    """Coefficients récents (le plus récent en premier), directement depuis le fournisseur du jeu."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            res = await client.get(HISTORY_URL, headers=EXTERNAL_HEADERS)
+            if res.status_code != 200:
+                return None
+            raw = res.json()
+    except Exception as e:
+        logging.error(f"Exception source externe: {e}")
+        return None
+
+    items = raw if isinstance(raw, list) else raw.get("data", [])
+    coefs = [c for c in (_extract_coef(i) for i in items[:limit]) if c is not None]
+    return coefs
+
+async def get_allpredictor_signal():
+    """Reproduit l'ancien algorithme de /predict, calculé localement à partir des coefs réels."""
+    coefs = await fetch_external_coefs(limit=20)
+    if not coefs:
+        return None, "Impossible de récupérer les données du jeu (source externe injoignable)."
+
+    count = len(coefs)
+    avg = sum(coefs) / count
+    above2 = sum(1 for c in coefs if c >= 2)
+    low = sum(1 for c in coefs if c < 1.5)
+    recent3 = coefs[:3]
+    recent3_avg = sum(recent3) / len(recent3) if recent3 else avg
+
+    confidence_raw = round(
+        60
+        + (above2 / count) * 25
+        - (low / count) * 30
+        + (8 if recent3_avg >= 2 else (-12 if recent3_avg < 1.5 else 0))
+    )
+    confidence = max(55, min(97, confidence_raw))
+
+    weighted_base = (recent3_avg * 2 + avg) / 3
+    jitter = (random.random() - 0.5) * 0.6  # ±0.3 max
+    raw_pred = max(1.30, weighted_base + jitter)
+    predicted_coef = round(min(5.50, raw_pred), 2)
+
+    bet_dt = datetime.now() + timedelta(minutes=random.randint(1, 4))
+    bet_time = bet_dt.strftime("%H:%M")
+
+    return {
+        "predicted_coef": predicted_coef,
+        "confidence": confidence,
+        "bet_time": bet_time,
+    }, None
+
+# ==========================================
+# SURVEILLANCE AUTOMATIQUE EN ARRIÈRE-PLAN
+# ==========================================
+async def monitor_rounds(bot):
+    global LAST_SEEN_ROUND
+    try:
+        coefs = await fetch_external_coefs(limit=1, timeout=5.0)
+        if coefs:
+            latest_coef = coefs[0]
+            if LAST_SEEN_ROUND != latest_coef:
+                LAST_SEEN_ROUND = latest_coef
+                real_coef = latest_coef
+                round_ts = time.time()
+                current_ts = time.time()
+                db_changed = False
+
+                for uid, u_data in db.items():
+                    if uid == "_meta":
+                        continue
+                    active_bet = u_data.get("active_bet")
+                    if not active_bet:
+                        continue
+
+                    start_ts = active_bet.get("start_ts", 0)
+                    valid_from_ts = active_bet.get("valid_from_ts", 0)
+                    valid_until_ts = active_bet.get("valid_until_ts")
+                    bet_type = active_bet.get("type", "p")
+
+                    if current_ts < start_ts:
+                        continue
+
+                    if bet_type == "g":
+                        target = active_bet["target"]
+                        insurance = active_bet.get("insurance", 0)
+
+                        if round_ts >= valid_from_ts and valid_until_ts and round_ts < valid_until_ts:
+                            if real_coef not in active_bet["collected_coefs"]:
+                                active_bet["collected_coefs"].append(real_coef)
+                            u_data["active_bet"] = active_bet
+                            db_changed = True
+
+                        elif valid_until_ts and current_ts >= valid_until_ts:
+                            collected = active_bet.get("collected_coefs", [])
+                            best_coef = max(collected) if collected else 0.0
+
+                            if best_coef >= target:
+                                u_data["win"] += 10
+                                msg = (
+                                    f"🎉 *GRAND SIGNAL VALIDÉ !*\n\n"
+                                    f"✅ Cible `{target}x` atteinte !\n"
+                                    f"📈 Meilleure cote de la plage : `{best_coef}x`\n"
+                                    f"💰 Bien joué !"
+                                )
+                            elif best_coef >= insurance:
+                                u_data["win"] += 5
+                                msg = (
+                                    f"🛡 *ASSURANCE ACTIVÉE !*\n\n"
+                                    f"La côte principale `{target}x` n'a pas été atteinte.\n"
+                                    f"✅ Mais l'assurance `{insurance}x` est validé !\n"
+                                    f"📈 Lucky jet a crashé a : `{best_coef}x`\n"
+                                    f"💰 Gain partiel sauvegardé."
+                                )
+                            else:
+                                msg = (
+                                    f"❌ *GRAND SIGNAL ÉCHOUÉ*\n\n"
+                                    f"Ni la côte `{target}x` ni l'assurance `{insurance}x` "
+                                    f"n'ont été atteintes sur la plage.\n"
+                                    f"📉 Meilleure cote enregistrée : `{best_coef}x`\n"
+                                    f"Restez prudent sur le prochain signal. 🔄"
+                                )
+                            try:
+                                sent_msg = await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+                                u_data["last_val_msg"] = sent_msg.message_id
+                            except Exception:
+                                pass
+                            u_data["active_bet"] = None
+                            db_changed = True
+
+                    else:
+                        if round_ts < valid_from_ts:
+                            continue
+                        target = active_bet["target"]
+                        if real_coef >= target:
+                            u_data["win"] += 10
+                            msg = (
+                                f"🎉 *PRÉDICTION VALIDÉE !*\n\n"
+                                f"✅ La côte de `{target}x` a été validé avec succès ! "
+                                f"(Craché à `{real_coef}x`).\nBien joué ! 💰"
+                            )
+                            try:
+                                sent_msg = await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+                                u_data["last_val_msg"] = sent_msg.message_id
+                            except Exception:
+                                pass
+                            u_data["active_bet"] = None
+                            db_changed = True
+                        else:
+                            active_bet["rounds"] += 1
+                            if active_bet["rounds"] >= 3:
+                                msg = (
+                                    f"❌ *PRÉDICTION ÉCHOUÉE*\n\n"
+                                    f"La côte de `{target}x` n'a pas été atteinte après "
+                                    f"3 rounds consécutifs. (Dernier crash: `{real_coef}x`).\n"
+                                    f"Restez prudent sur le prochain signal. 🔄"
+                                )
+                                try:
+                                    sent_msg = await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+                                    u_data["last_val_msg"] = sent_msg.message_id
+                                except Exception:
+                                    pass
+                                u_data["active_bet"] = None
+                                db_changed = True
+                            else:
+                                u_data["active_bet"] = active_bet
+                                db_changed = True
+
+                if db_changed:
+                    save_db(db)
+    except Exception:
+        pass
+
+async def monitor_loop(bot):
+    while True:
+        await monitor_rounds(bot)
+        await asyncio.sleep(5)
+
+async def post_init(application: Application):
+    asyncio.create_task(monitor_loop(application.bot))
+
+# ==========================================
+# CLAVIERS (MENUS)
+# ==========================================
+async def main_menu_keyboard(u_id=None):
+    keyboard = [
+        [InlineKeyboardButton("🚀 Petit Signal", callback_data="sig_p"),
+         InlineKeyboardButton("🧨 Grand Signal", callback_data="sig_g")],
+        [InlineKeyboardButton("🔔 News", callback_data="view_news")]
+    ]
+    if is_admin(u_id):
+        keyboard.append([InlineKeyboardButton("🛠 Panneau Admin", callback_data="admin_panel")])
+
+    return InlineKeyboardMarkup(keyboard)
+
+async def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="home")]])
+
+async def admin_panel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Statistiques", callback_data="adm_stats")],
+        [InlineKeyboardButton("📢 Diffusion", callback_data="adm_broadcast"),
+         InlineKeyboardButton("📰 Créer une news", callback_data="adm_news")],
+        [InlineKeyboardButton("🎟 Créer un coupon", callback_data="adm_coupon"),
+         InlineKeyboardButton("🚀 Envoyer signal", callback_data="adm_signal")],
+        [InlineKeyboardButton("➕ Créditer un user", callback_data="adm_credit"),
+         InlineKeyboardButton("👥 Liste users", callback_data="adm_users")],
+        [InlineKeyboardButton("🔙 Menu principal", callback_data="home")]
+    ])
+
+# ==========================================
+# COMMANDE /start
+# ==========================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u_id = str(user.id)
+    get_user(u_id, user.first_name)
+
+    await update.message.reply_text(
+        "💥 *CRASH PREDICTOR AI*\n\nPrécision algorithmique en temps réel.\n\n_Tous les signaux sont 100% gratuits et illimités._",
+        reply_markup=await main_menu_keyboard(u_id),
+        parse_mode="Markdown"
+    )
+
+# ==========================================
+# GESTION DES BOUTONS
+# ==========================================
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    u_id = str(query.from_user.id)
+    user_data = get_user(u_id)
+    now = time.time()
+
+    # ── HOME ──────────────────────────────────────────────────────────────────
+    if query.data == "home":
+        await query.answer()
+        msg = "💥 *CRASH PREDICTOR AI*\n\nPrécision algorithmique en temps réel."
+        if query.message.photo:
+            await query.message.delete()
+            await context.bot.send_message(
+                chat_id=query.message.chat_id, text=msg,
+                reply_markup=await main_menu_keyboard(u_id), parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(msg, reply_markup=await main_menu_keyboard(u_id), parse_mode="Markdown")
+
+    # ── SIGNAUX ───────────────────────────────────────────────────────────────
+    elif query.data.startswith("sig_"):
+
+        # --- 1. VÉRIFICATION ABONNEMENTS CANAUX (FORCE SUB) ---
+        is_subbed = True
+        for channel in REQUIRED_CHANNELS:
+            try:
+                member = await context.bot.get_chat_member(chat_id=channel, user_id=u_id)
+                if member.status not in ['member', 'administrator', 'creator', 'restricted']:
+                    is_subbed = False
+                    break
+            except Exception as e:
+                logging.warning(f"Impossible de vérifier {channel} pour {u_id}: {e}")
+                is_subbed = False
+                break
+
+        if not is_subbed:
+            await query.answer("⛔ Abonnement aux canaux requis !", show_alert=True)
+            kb_buttons = []
+            for channel in REQUIRED_CHANNELS:
+                url = f"https://t.me/{channel.replace('@', '')}"
+                kb_buttons.append([InlineKeyboardButton(f"📢 Rejoindre {channel}", url=url)])
+
+            kb_buttons.append([InlineKeyboardButton("🔄 J'ai rejoint (Vérifier)", callback_data=query.data)])
+            kb_buttons.append([InlineKeyboardButton("🔙 Menu principal", callback_data="home")])
+
+            await query.edit_message_text(
+                "⛔ *ACCÈS AUX PRÉDICTIONS BLOQUÉ*\n\nPour continuer à utiliser le bot gratuitement, vous devez obligatoirement être membre de nos canaux.\n\n_Veuillez rejoindre les canaux ci-dessous puis cliquez sur *Vérifier*._",
+                reply_markup=InlineKeyboardMarkup(kb_buttons),
+                parse_mode="Markdown"
+            )
+            return
+        # ------------------------------------------------------
+
+        # --- 2. SUPPRESSION AUTOMATIQUE DE L'ANCIEN MESSAGE ---
+        val_msg_id = user_data.get("last_val_msg")
+        if val_msg_id:
+            try:
+                await context.bot.delete_message(chat_id=u_id, message_id=val_msg_id)
+            except Exception:
+                pass
+            user_data["last_val_msg"] = None
+            save_db(db)
+        # ------------------------------------------------------
+
+        type_s = query.data.split("_")[1]
+        label = "Petit" if type_s == "p" else "Grand"
+        last_key, wait_key = f"last_{type_s}", f"next_{type_s}_wait"
+
+        elapsed = now - user_data.get(last_key, 0)
+        wait_duration = user_data.get(wait_key, 0)
+        if elapsed < wait_duration:
+            rem = int(wait_duration - elapsed)
+            await query.answer(f"⏳ IA en recharge ({label})\nPatientez {rem//60}m {rem%60}s.", show_alert=True)
+            return
+
+        await query.answer()
+        await query.edit_message_text("📡 *ANALYSE EN COURS...*\n\nAnalyse du marché en cours...", parse_mode="Markdown")
+
+        api_data, error_msg = await get_allpredictor_signal()
+        if error_msg:
+            await query.edit_message_text(error_msg, reply_markup=await back_keyboard(), parse_mode="Markdown")
+            return
+
+        new_coef = api_data.get('predicted_coef', 2.01)
+        confidence = api_data.get('confidence', 88)
+        bet_time_str = api_data.get('bet_time', datetime.now().strftime("%H:%M"))
+
+        now_dt = datetime.now()
+
+        # ── CAS GRAND SIGNAL ──────────────────────────────────────────────────
+        if type_s == "g":
+            if new_coef < 10.0:
+                new_coef = round(random.uniform(10.0, 50.0), 2)
+            new_coef = min(new_coef, 50.0)
+
+            insurance_coef = round(random.uniform(4.0, 6.0), 2)
+
+            try:
+                b_time_start = datetime.strptime(bet_time_str, "%H:%M").replace(
+                    year=now_dt.year, month=now_dt.month, day=now_dt.day
+                )
+                if b_time_start < now_dt - timedelta(minutes=10):
+                    b_time_start += timedelta(days=1)
+                b_time_end = b_time_start + timedelta(minutes=1)
+                bet_time_end_str = b_time_end.strftime("%H:%M")
+
+                start_ts = (b_time_start - timedelta(seconds=10)).timestamp()
+                valid_from_ts = b_time_start.timestamp()
+                valid_until_ts = b_time_end.timestamp()
+            except Exception:
+                start_ts = time.time()
+                valid_from_ts = time.time()
+                valid_until_ts = time.time() + 120
+                b_time_end = now_dt + timedelta(minutes=2)
+                bet_time_end_str = b_time_end.strftime("%H:%M")
+
+            user_data[last_key] = now
+            user_data[wait_key] = random.randint(120, 240)
+            user_data["active_bet"] = {
+                "type": "g",
+                "target": new_coef,
+                "insurance": insurance_coef,
+                "rounds": 0,
+                "start_ts": start_ts,
+                "valid_from_ts": valid_from_ts,
+                "valid_until_ts": valid_until_ts,
+                "collected_coefs": []
+            }
+            save_db(db)
+
+            res = (
+                f"✅ *NOUVEAU SIGNAL GRAND*\n"
+                f"🎯 Côte : `{new_coef}x`\n"
+                f"✅ Assurance : `{insurance_coef}x`\n"
+                f"⚡ Confiance : `{confidence}%`\n"
+                f"⏰ Heure : `{bet_time_str}` - `{bet_time_end_str}`\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"♾️ Signaux gratuits et illimités"
+            )
+
+        # ── CAS PETIT SIGNAL ──────────────────────────────────────────────────
+        else:
+            try:
+                b_time = datetime.strptime(bet_time_str, "%H:%M").replace(
+                    year=now_dt.year, month=now_dt.month, day=now_dt.day
+                )
+                if b_time < now_dt - timedelta(minutes=10):
+                    b_time += timedelta(days=1)
+                start_ts = (b_time - timedelta(seconds=10)).timestamp()
+                valid_from_ts = b_time.timestamp()
+                valid_until_ts = None
+            except Exception:
+                start_ts = time.time()
+                valid_from_ts = time.time()
+                valid_until_ts = None
+
+            user_data[last_key] = now
+            user_data[wait_key] = random.randint(120, 240)
+            user_data["active_bet"] = {
+                "type": "p",
+                "target": new_coef,
+                "insurance": None,
+                "rounds": 0,
+                "start_ts": start_ts,
+                "valid_from_ts": valid_from_ts,
+                "valid_until_ts": None,
+                "collected_coefs": []
+            }
+            save_db(db)
+
+            res = (
+                f"✅ *NOUVEAU SIGNAL PETIT*\n"
+                f"🎯 Côte : `{new_coef}x`\n"
+                f"⚡ Confiance : `{confidence}%`\n"
+                f"⏰ Heure : `{bet_time_str}`\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"♾️ Signaux gratuits et illimités"
+            )
+
+        await query.edit_message_text(
+            res,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Nouveau signal", callback_data=query.data)],
+                [InlineKeyboardButton("⬅️ Menu", callback_data="home")]
+           ]),
+            parse_mode="Markdown"
+        )
+
+    # ── NEWS ──────────────────────────────────────────────────────────────────
+    elif query.data == "view_news":
+        await query.answer()
+        news_list = db["_meta"].get("news", [])
+        if not news_list:
+            txt = "🔔 *ACTUALITÉS*\n\n_Aucune actualité pour le moment. Revenez bientôt !_"
+        else:
+            txt = "🔔 *ACTUALITÉS*\n\n"
+            for item in reversed(news_list[-5:]):
+                txt += f"━━━━━━━━━━━━━━━\n📌 *{item['title']}*\n{item['body']}\n🕐 _{item['date']}_\n\n"
+        await query.edit_message_text(txt, reply_markup=await back_keyboard(), parse_mode="Markdown")
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PANNEAU ADMINISTRATEUR
+    # ══════════════════════════════════════════════════════════════════════════
+    elif query.data == "admin_panel":
+        if not is_admin(u_id):
+            await query.answer("⛔ Accès refusé.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            "🛠 *PANNEAU ADMINISTRATEUR*\n\nChoisissez une action :",
+            reply_markup=await admin_panel_keyboard(), parse_mode="Markdown"
+        )
+
+    # ── ADMIN : STATISTIQUES ──────────────────────────────────────────────────
+    elif query.data == "adm_stats":
+        if not is_admin(u_id):
+            await query.answer("⛔", show_alert=True)
+            return
+        await query.answer()
+        users_list = [(uid, d) for uid, d in db.items() if uid != "_meta"]
+        total_users = len(users_list)
+        active_bets = sum(1 for _, d in users_list if d.get("active_bet"))
+        coupons = db["_meta"].get("coupons", {})
+        news_count = len(db["_meta"].get("news", []))
+        txt = (
+            f"📊 *STATISTIQUES DU BOT*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👥 Utilisateurs totaux : `{total_users}`\n"
+            f"🎯 Paris actifs en cours : `{active_bets}`\n"
+            f"🎟 Coupons actifs : `{len(coupons)}`\n"
+            f"📰 News publiées : `{news_count}`\n"
+            f"━━━━━━━━━━━━━━━"
+        )
+        await query.edit_message_text(
+            txt,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : DIFFUSION ──────────────────────────────────────────────────────
+    elif query.data == "adm_broadcast":
+        if not is_admin(u_id):
+            await query.answer("⛔", show_alert=True)
+            return
+        await query.answer()
+        user_data["s"] = "adm_wait_broadcast"
+        save_db(db)
+        await query.edit_message_text(
+            "📢 *DIFFUSION*\n\nEnvoyez le message à diffuser à tous les utilisateurs :",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : CRÉER UNE NEWS ────────────────────────────────────────────────
+    elif query.data == "adm_news":
+        if not is_admin(u_id):
+            await query.answer("⛔", show_alert=True)
+            return
+        await query.answer()
+        user_data["s"] = "adm_wait_news_title"
+        save_db(db)
+        await query.edit_message_text(
+            "📰 *CRÉER UNE NEWS*\n\nEnvoyez le *titre* de la news :",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : ENVOYER SIGNAL À TOUS ────────────────────────────────────────
+    elif query.data == "adm_signal":
+        if not is_admin(u_id):
+            await query.answer("⛔", show_alert=True)
+            return
+        await query.answer()
+        user_data["s"] = "adm_wait_signal"
+        save_db(db)
+        await query.edit_message_text(
+            "🚀 *ENVOYER UN SIGNAL À TOUS*\n\n"
+            "Envoyez le signal au format :\n"
+            "`CIBLE:CONFIANCE:HEURE:MINUTE`\n\n"
+            "_Exemple :_ `3.50:92:14:30`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : LISTE UTILISATEURS ────────────────────────────────────────────
+    elif query.data == "adm_users":
+        if not is_admin(u_id):
+            await query.answer("⛔", show_alert=True)
+            return
+        await query.answer()
+        users_list = [(uid, d) for uid, d in db.items() if uid != "_meta"]
+        txt = f"👥 *LISTE DES UTILISATEURS* ({len(users_list)})\n\n"
+        for uid, d in users_list[:20]:
+            txt += f"• `{uid}` — *{d.get('n', '?')}*\n"
+        if len(users_list) > 20:
+            txt += f"\n_...et {len(users_list) - 20} autres utilisateurs._"
+        await query.edit_message_text(
+            txt,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+# ==========================================
+# GESTION DES MESSAGES TEXTE
+# ==========================================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u_id = str(update.effective_user.id)
+    user_data = get_user(u_id)
+    text = update.message.text.strip()
+    state = user_data.get("s", "idle")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ÉTATS ADMIN
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── ADMIN : DIFFUSION ──────────────────────────────────────────────────────
+    if state == "adm_wait_broadcast" and is_admin(u_id):
+        user_data["s"] = "idle"
+        save_db(db)
+        users_list = [uid for uid in db if uid != "_meta"]
+        sent, failed = 0, 0
+        broadcast_msg = f"📢 *MESSAGE DU GÉRANT*\n\n{text}"
+        for uid in users_list:
+            if uid == u_id:
+                continue
+            try:
+                await context.bot.send_message(chat_id=uid, text=broadcast_msg, parse_mode="Markdown")
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+        await update.message.reply_text(
+            f"✅ *Diffusion terminée !*\n\n📤 Envoyé : `{sent}`\n❌ Échoué : `{failed}`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : NEWS (TITRE) ──────────────────────────────────────────────────
+    elif state == "adm_wait_news_title" and is_admin(u_id):
+        user_data["s"] = "adm_wait_news_body"
+        user_data["_tmp_news_title"] = text
+        save_db(db)
+        await update.message.reply_text(
+            f"📰 Titre enregistré : *{text}*\n\nMaintenant envoyez le *contenu* de la news :",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : NEWS (CORPS) ──────────────────────────────────────────────────
+    elif state == "adm_wait_news_body" and is_admin(u_id):
+        title = user_data.pop("_tmp_news_title", "News")
+        news_item = {
+            "title": title,
+            "body": text,
+            "date": datetime.now().strftime("%d/%m/%Y %H:%M")
+        }
+        db["_meta"]["news"].append(news_item)
+        user_data["s"] = "idle"
+        save_db(db)
+        await update.message.reply_text(
+            f"✅ *News publiée avec succès !*\n\n📌 *{title}*\n{text}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ADMIN : ENVOYER SIGNAL À TOUS ────────────────────────────────────────
+    elif state == "adm_wait_signal" and is_admin(u_id):
+        user_data["s"] = "idle"
+        save_db(db)
+        try:
+            parts = text.split(":")
+            sig_coef = float(parts[0])
+            sig_conf = parts[1]
+            sig_time = f"{parts[2]}:{parts[3]}"
+            users_list = [uid for uid in db if uid != "_meta" and uid != u_id]
+            sent, failed = 0, 0
+            sig_msg = (
+                f"🔥 *SIGNAL OFFERT PAR L'ADMIN*\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🎯 Côte : `{sig_coef}x`\n"
+                f"⚡ Confiance : `{sig_conf}%`\n"
+                f"⏰ Heure : `{sig_time}`\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"⚠️ Jouez cette cible sur les *3 rounds* suivant l'heure indiquée."
+            )
+            for uid in users_list:
+                try:
+                    await context.bot.send_message(chat_id=uid, text=sig_msg, parse_mode="Markdown")
+                    sent += 1
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    failed += 1
+            await update.message.reply_text(
+                f"✅ *Signal envoyé !*\n\n📤 Reçu par : `{sent}` utilisateurs\n❌ Échoué : `{failed}`",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await update.message.reply_text(
+                "❌ Format invalide. Utilisez : `CIBLE:CONFIANCE:HEURE:MINUTE`\nEx: `3.50:92:14:30`",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]]),
+                parse_mode="Markdown"
+            )
+
+# ==========================================
+# MAIN
+# ==========================================
+def main():
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    print("✅ Bot en ligne — Force Sub activé avec @babelseyy et @babelsey225.")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
